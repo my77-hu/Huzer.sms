@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 
-import csv
-import os
 import re
 import subprocess
 import sys
+import time
 from datetime import datetime
 
 
-def run(command, timeout=30):
+CHECK_EVERY_SECONDS = 5
+
+
+def run(command, timeout=20):
     try:
         result = subprocess.run(
             command,
@@ -18,49 +20,92 @@ def run(command, timeout=30):
         )
         return result.returncode, result.stdout, result.stderr
     except subprocess.TimeoutExpired:
-        return 124, "", "انتهت مهلة الاتصال"
+        return 124, "", "انتهت مهلة الأمر"
     except FileNotFoundError:
-        return 127, "", "لم يتم العثور على adb"
+        return 127, "", "adb غير مثبت"
 
 
-def parse_row(line):
+def find_devices():
+    code, stdout, stderr = run(["adb", "devices"])
+
+    if code != 0:
+        print("[-] تعذر تشغيل adb:")
+        print(stderr.strip())
+        sys.exit(1)
+
+    devices = []
+
+    for line in stdout.splitlines():
+        line = line.strip()
+
+        if not line or line.startswith("List of devices"):
+            continue
+
+        parts = line.split()
+
+        if len(parts) >= 2 and parts[1] == "device":
+            devices.append(parts[0])
+
+    return devices
+
+
+def choose_device():
+    devices = find_devices()
+
+    if not devices:
+        print("[-] لم يتم العثور على جهاز متصل.")
+        print()
+        print("نفّذ أولًا:")
+        print("adb devices")
+        print()
+        print("ثم تأكد من ظهور الجهاز بحالة device.")
+        sys.exit(1)
+
+    if len(devices) == 1:
+        return devices[0]
+
+    print("تم العثور على أكثر من جهاز:")
+    for index, device in enumerate(devices, 1):
+        print(f"{index}. {device}")
+
+    while True:
+        try:
+            choice = int(input("اختر رقم الجهاز: "))
+            if 1 <= choice <= len(devices):
+                return devices[choice - 1]
+        except ValueError:
+            pass
+
+        print("اختيار غير صحيح.")
+
+
+def parse_sms_line(line):
     """
-    تحليل سطر Android content query.
+    يحلل سطر content query ويستخرج رقم الرسالة والمرسل والنص والتاريخ.
     """
-    values = {}
 
-    # يدعم body الذي قد يحتوي على فاصلات في أغلب الحالات
-    pattern = r"(address|body|date|read|type)=(.*?)(?=, \w+=|$)"
-    matches = re.findall(pattern, line)
+    result = {}
 
-    for key, value in matches:
-        values[key] = value.strip()
+    # يلتقط القيم حتى بداية الحقل التالي
+    pattern = r"(_id|address|body|date|read|type)=(.*?)(?=, \w+=|$)"
 
-    return values
+    for key, value in re.findall(pattern, line):
+        result[key] = value.strip()
+
+    return result
 
 
-def readable_date(value):
+def format_date(value):
     try:
         timestamp = int(value) / 1000
-        return datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d %H:%M:%S")
+        return datetime.fromtimestamp(timestamp).strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
     except Exception:
         return value or ""
 
 
-def check_connection(device):
-    code, stdout, stderr = run(["adb", "-s", device, "get-state"])
-
-    if code != 0 or "device" not in stdout:
-        print("[-] الهاتف غير متصل عبر ADB.")
-        print(stderr.strip() or stdout.strip())
-        print()
-        print("نفّذ أولًا:")
-        print(f"adb connect {device}")
-        print("adb devices")
-        sys.exit(1)
-
-
-def read_sms(device):
+def read_inbox(device):
     command = [
         "adb",
         "-s",
@@ -71,28 +116,28 @@ def read_sms(device):
         "--uri",
         "content://sms/inbox",
         "--projection",
-        "address:body:date:read:type",
+        "_id:address:body:date:read:type",
         "--sort",
-        "date DESC",
+        "date ASC",
     ]
 
-    code, stdout, stderr = run(command)
+    code, stdout, stderr = run(command, timeout=30)
 
     if code != 0:
-        print("[-] فشل الوصول إلى صندوق الرسائل:")
+        print("[-] فشل قراءة صندوق الرسائل:")
         print(stderr.strip() or stdout.strip())
-        sys.exit(1)
+        return []
 
     messages = []
 
     for line in stdout.splitlines():
-        if "Row:" not in line and "address=" not in line:
+        if "Row:" not in line and "_id=" not in line:
             continue
 
-        message = parse_row(line)
+        message = parse_sms_line(line)
 
-        if message:
-            message["date_readable"] = readable_date(
+        if message.get("_id"):
+            message["date_readable"] = format_date(
                 message.get("date", "")
             )
             messages.append(message)
@@ -100,87 +145,75 @@ def read_sms(device):
     return messages
 
 
-def save_text(messages, filename="sms.txt"):
-    with open(filename, "w", encoding="utf-8") as file:
-        for number, message in enumerate(messages, 1):
-            file.write(f"الرسالة رقم {number}\n")
-            file.write(f"المرسل: {message.get('address', '')}\n")
-            file.write(f"التاريخ: {message.get('date_readable', '')}\n")
-            file.write(f"مقروءة: {message.get('read', '')}\n")
-            file.write(f"النص: {message.get('body', '')}\n")
-            file.write("-" * 60)
-            file.write("\n")
+def message_key(message):
+    """
+    نستخدم _id لمنع عرض الرسالة نفسها أكثر من مرة.
+    """
+    return message.get("_id") or (
+        message.get("address", ""),
+        message.get("body", ""),
+        message.get("date", "")
+    )
 
 
-def save_csv(messages, filename="sms.csv"):
-    with open(filename, "w", encoding="utf-8-sig", newline="") as file:
-        writer = csv.writer(file)
-
-        writer.writerow([
-            "المرسل",
-            "النص",
-            "التاريخ",
-            "مقروءة",
-            "النوع",
-        ])
-
-        for message in messages:
-            writer.writerow([
-                message.get("address", ""),
-                message.get("body", ""),
-                message.get("date_readable", ""),
-                message.get("read", ""),
-                message.get("type", ""),
-            ])
+def print_message(message, title="رسالة"):
+    print()
+    print("=" * 60)
+    print(title)
+    print(f"المعرّف: {message.get('_id', '')}")
+    print(f"المرسل: {message.get('address', '')}")
+    print(f"التاريخ: {message.get('date_readable', '')}")
+    print(f"مقروءة: {message.get('read', '')}")
+    print(f"النص: {message.get('body', '')}")
+    print("=" * 60)
 
 
 def main():
-    # يمكن تمرير العنوان كوسيط:
-    # python read_sms.py 10.179.39.245:43397
-    #
-    # أو وضعه في متغير بيئة:
-    # export ADB_DEVICE=10.179.39.245:43397
-    device = (
-        sys.argv[1]
-        if len(sys.argv) > 1
-        else os.environ.get("ADB_DEVICE")
-    )
+    print("[*] البحث عن جهاز ADB متصل تلقائيًا...")
+    device = choose_device()
 
-    if not device:
-        print("طريقة الاستخدام:")
-        print("python read_sms.py IP:PORT")
-        print()
-        print("مثال:")
-        print("python read_sms.py 10.179.39.245:43397")
-        sys.exit(1)
-
-    print(f"[*] التحقق من الاتصال: {device}")
-    check_connection(device)
-
+    print(f"[+] الجهاز المستخدم: {device}")
     print("[*] قراءة الرسائل الموجودة حاليًا...")
-    print("[*] لا توجد مراقبة مستمرة للرسائل الجديدة.")
 
-    messages = read_sms(device)
+    known_ids = set()
+    current_messages = read_inbox(device)
 
-    if not messages:
-        print("[!] لم يتم العثور على رسائل في صندوق الوارد.")
-        print("[!] قد يكون الوصول محميًا بواسطة إصدار Android أو تطبيق الرسائل.")
-        return
+    for message in current_messages:
+        known_ids.add(message_key(message))
+        print_message(message, "رسالة موجودة حاليًا")
 
-    save_text(messages)
-    save_csv(messages)
-
-    print(f"[+] عدد الرسائل: {len(messages)}")
-    print("[+] تم الحفظ في الملف: sms.txt")
-    print("[+] تم الحفظ بصيغة CSV في الملف: sms.csv")
     print()
+    print(
+        f"[+] تم تحميل {len(current_messages)} رسالة موجودة."
+    )
+    print(
+        f"[*] المراقبة فعالة؛ سيتم الفحص كل {CHECK_EVERY_SECONDS} ثوانٍ."
+    )
+    print("[*] اضغط CTRL+C للإيقاف.")
 
-    for number, message in enumerate(messages, 1):
-        print(f"--- الرسالة {number} ---")
-        print(f"المرسل: {message.get('address', '')}")
-        print(f"التاريخ: {message.get('date_readable', '')}")
-        print(f"النص: {message.get('body', '')}")
+    try:
+        while True:
+            devices = find_devices()
+
+            if device not in devices:
+                print("[-] انقطع اتصال الجهاز، سيتم البحث عنه مجددًا...")
+                time.sleep(CHECK_EVERY_SECONDS)
+                continue
+
+            messages = read_inbox(device)
+
+            for message in messages:
+                key = message_key(message)
+
+                if key not in known_ids:
+                    known_ids.add(key)
+                    print_message(message, "رسالة جديدة")
+
+            time.sleep(CHECK_EVERY_SECONDS)
+
+    except KeyboardInterrupt:
         print()
+        print("[+] تم إيقاف المراقبة.")
 
 
 if __name__ == "__main__":
